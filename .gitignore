@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.tmp/
+.pip-tmp/
+.pytest_cache/
+.mypy_cache/
+node_modules/
+logs/
+.env
+*.log
+*.csv

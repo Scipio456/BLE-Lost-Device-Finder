@@ -1,0 +1,18 @@
+{
+  "name": "earpods-searcher-backend",
+  "version": "1.0.0",
+  "description": "Node.js backend wrapper for the Python BLE earpods tracker.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "tracker": "node tracker-cli.js",
+    "list": "node tracker-cli.js --list",
+    "diagnose": "node tracker-cli.js --diagnose",
+    "check": "node --check server.js && node --check tracker-cli.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "UNLICENSED"
+}
