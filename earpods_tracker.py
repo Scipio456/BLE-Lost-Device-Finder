@@ -2,15 +2,23 @@ import argparse
 import asyncio
 import csv
 import json
+import os
 import statistics
 import sys
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Deque, Iterable, Optional, Tuple
+from typing import Deque, Iterable, List, Optional, Tuple
 
 from bleak import BleakScanner
+from dotenv import load_dotenv
+
+# Try to import msvcrt for Windows-specific non-blocking keyboard input
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 
 SAFETY_NOTICE = """
@@ -20,6 +28,53 @@ Bluetooth safety rules:
   - Distance is only an estimate from signal strength, never an exact physical measurement.
   - Earbuds may stop advertising when inside their case, powered off, or connected in a vendor-specific way.
 """.strip()
+
+
+@dataclass
+class Target:
+    name: Optional[str] = None
+    address: Optional[str] = None
+
+    def __str__(self) -> str:
+        if self.name and self.address:
+            return f"{self.name} ({self.address})"
+        return self.name or self.address or "Unknown"
+
+
+class TargetManager:
+    def __init__(self, targets: List[Target]) -> None:
+        self.targets = targets
+        self.active_index = 0
+
+    @property
+    def active_target(self) -> Optional[Target]:
+        if not self.targets:
+            return None
+        return self.targets[self.active_index]
+
+    def cycle(self) -> Target:
+        if not self.targets:
+            return None
+        self.active_index = (self.active_index + 1) % len(self.targets)
+        return self.active_target
+
+    def matches(self, device_address: str, device_name: str) -> bool:
+        for target in self.targets:
+            if target.address and target.address.lower() == device_address.lower():
+                return True
+            if target.name and target.name.lower() in device_name.lower():
+                return True
+        return False
+
+    def is_active(self, device_address: str, device_name: str) -> bool:
+        active = self.active_target
+        if not active:
+            return False
+        if active.address and active.address.lower() == device_address.lower():
+            return True
+        if active.name and active.name.lower() in device_name.lower():
+            return True
+        return False
 
 
 @dataclass
@@ -97,6 +152,11 @@ class DistanceFilter:
 
 
 def parse_args() -> argparse.Namespace:
+    try:
+        load_dotenv()
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(
         description="Track nearby Bluetooth earbuds by RSSI and estimate distance."
     )
@@ -117,23 +177,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--target-name",
-        help="Track the first nearby device whose name contains this text.",
+        help="Track the first nearby device whose name contains this text. Supports comma-separated list.",
     )
     parser.add_argument(
         "--target-address",
-        help="Track a specific BLE MAC/address exactly.",
+        help="Track a specific BLE MAC/address exactly. Supports comma-separated list.",
     )
     parser.add_argument(
         "--scan-time",
         type=float,
-        default=1.0,
-        help="Seconds to scan during each refresh. Default: 1.0",
+        default=0.5,
+        help="Seconds to scan during each refresh. Default: 0.5",
     )
     parser.add_argument(
         "--refresh-interval",
         type=float,
-        default=0.2,
-        help="Seconds to wait between scans. Default: 0.2",
+        default=0.05,
+        help="Seconds to wait between scans. Default: 0.05",
     )
     parser.add_argument(
         "--window-size",
@@ -144,14 +204,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reference-rssi",
         type=int,
-        default=-59,
-        help="Calibrated RSSI at 1 meter. Default: -59 dBm",
+        default=int(os.getenv("REFERENCE_RSSI", "-59")),
+        help="Calibrated RSSI at 1 meter. Default: -59 dBm (or from .env)",
     )
     parser.add_argument(
         "--path-loss",
         type=float,
-        default=2.2,
-        help="Signal path-loss exponent. Indoor environments are often 2.0 to 4.0. Default: 2.2",
+        default=float(os.getenv("PATH_LOSS_EXPONENT", "2.2")),
+        help="Signal path-loss exponent. Default: 2.2 (or from .env)",
     )
     parser.add_argument(
         "--log",
@@ -182,6 +242,12 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
 
+    # Load from environment if not provided via CLI
+    if not args.target_address:
+        args.target_address = os.getenv("TARGET_ADDRESSES")
+    if not args.target_name:
+        args.target_name = os.getenv("TARGET_NAME") or os.getenv("TARGET_NAMES")
+
     if args.window_size < 1:
         parser.error("--window-size must be at least 1")
     if args.scan_time <= 0 or args.refresh_interval < 0:
@@ -199,9 +265,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--json can only be used with --list or --diagnose")
     if args.json_lines and (args.list or args.diagnose):
         parser.error("--json-lines is only for live tracking")
-    if args.json_lines and not (args.target_name or args.target_address):
-        parser.error("--json-lines requires --target-name or --target-address")
-
+    
+    # If no targets provided and not listing, default to choose mode
     if not args.list and not args.diagnose and not (args.target_name or args.target_address):
         args.choose = True
 
@@ -241,21 +306,6 @@ def iter_devices(discovery_result) -> Iterable[Tuple[object, object]]:
     if isinstance(discovery_result, dict):
         return discovery_result.values()
     return discovery_result
-
-
-def target_matches(
-    device,
-    advertisement_data,
-    target_name: Optional[str],
-    target_address: Optional[str],
-) -> bool:
-    address = getattr(device, "address", "") or ""
-    name = normalize_name(device, advertisement_data)
-    if target_address and address.lower() != target_address.lower():
-        return False
-    if target_name and target_name.lower() not in name.lower():
-        return False
-    return True
 
 
 def estimate_distance_meters(
@@ -393,7 +443,8 @@ async def list_devices(scan_time: float, json_output: bool = False) -> None:
 
 async def choose_device_interactively(scan_time: float) -> Optional[Tuple[str, str]]:
     while True:
-        discovery_result = await discover_with_advertisements(scan_time)
+        print("\nScanning for BLE devices (0.5s)...")
+        discovery_result = await discover_with_advertisements(0.5) # Force fast scan for UI
         rows = []
 
         for device, advertisement_data in iter_devices(discovery_result):
@@ -494,6 +545,24 @@ async def diagnose_devices(scan_time: float, json_output: bool = False) -> None:
 
 
 async def track_device(args: argparse.Namespace) -> None:
+    # Prepare targets
+    target_list = []
+    if args.target_address:
+        for addr in args.target_address.split(","):
+            if addr.strip():
+                target_list.append(Target(address=addr.strip()))
+    if args.target_name:
+        for name in args.target_name.split(","):
+            if name.strip():
+                # Check if we already have a target with this name (from address split)
+                target_list.append(Target(name=name.strip()))
+    
+    if not target_list:
+        print("No targets specified for tracking.")
+        return
+
+    manager = TargetManager(target_list)
+
     if args.json_lines:
         print_json_line(
             {
@@ -502,22 +571,14 @@ async def track_device(args: argparse.Namespace) -> None:
                 "message": SAFETY_NOTICE,
             }
         )
-        print_json_line(
-            {
-                "type": "status",
-                "timestamp": iso_now(),
-                "message": "Local logging enabled." if args.log else "Local logging disabled.",
-                "log_path": str(args.log) if args.log else None,
-            }
-        )
     else:
         print(SAFETY_NOTICE)
         print("")
-        if args.log:
-            print(f"Local logging enabled: {args.log}")
+        print(f"Tracking targets: {', '.join(str(t) for t in target_list)}")
+        if msvcrt:
+            print("Press 'n' to cycle between targets, Ctrl+C to stop.")
         else:
-            print("Local logging disabled.")
-        print("Press Ctrl+C to stop.")
+            print("Press Ctrl+C to stop.")
         print("")
 
     window = RssiWindow(args.window_size)
@@ -532,55 +593,85 @@ async def track_device(args: argparse.Namespace) -> None:
         log_handle, log_writer = open_log_writer(args.log)
 
     def detection_callback(device, advertisement_data) -> None:
-        if target_matches(
-            device,
-            advertisement_data,
-            args.target_name,
-            args.target_address,
-        ):
+        address = getattr(device, "address", "") or ""
+        name = normalize_name(device, advertisement_data)
+        if manager.matches(address, name):
             event_queue.put_nowait((device, advertisement_data))
+
+    async def keyboard_listener():
+        # Handle both interactive keyboard (msvcrt) and piped stdin (for backend)
+        loop = asyncio.get_event_loop()
+        cmd_queue = asyncio.Queue()
+
+        def on_stdin():
+            line = sys.stdin.readline().strip().lower()
+            if line:
+                cmd_queue.put_nowait(line[0])
+
+        if not msvcrt:
+            # If no msvcrt (e.g. running under Node.js), use stdin reader
+            try:
+                loop.add_reader(sys.stdin, on_stdin)
+            except (NotImplementedError, AttributeError):
+                # Fallback for systems/event loops where add_reader isn't available
+                pass
+
+        while True:
+            char = None
+            if msvcrt and msvcrt.kbhit():
+                char = msvcrt.getch().decode().lower()
+            
+            # Also check if a command came via the stdin reader
+            if not char and not cmd_queue.empty():
+                char = await cmd_queue.get()
+
+            if char:
+                if char == 'n':
+                    new_target = manager.cycle()
+                    if not args.json_lines:
+                        print(f"\n>>> Switched to target: {new_target}")
+                    window._values.clear()
+                    distance_filter._distance_m = None
+                elif char == 'b':
+                    if not msvcrt: loop.remove_reader(sys.stdin)
+                    return "back"
+                elif char == 'q':
+                    if not msvcrt: loop.remove_reader(sys.stdin)
+                    return "quit"
+            
+            await asyncio.sleep(0.1)
+
+    kb_task = asyncio.create_task(keyboard_listener())
 
     try:
         scanner = BleakScanner(detection_callback=detection_callback)
         await scanner.start()
+        
         while True:
+            # Check if keyboard listener finished with a signal
+            if kb_task.done():
+                return kb_task.result()
+
             try:
                 device, advertisement_data = await asyncio.wait_for(
                     event_queue.get(),
-                    timeout=max(args.scan_time, 0.5),
+                    timeout=0.1, # Short timeout to keep loop responsive to kb_task
                 )
             except asyncio.TimeoutError:
-                missed_scans += 1
-                if missed_scans >= args.max_missed:
-                    if args.json_lines:
-                        print_json_line(
-                            {
-                                "type": "missed",
-                                "timestamp": iso_now(),
-                                "missed_scans": missed_scans,
-                                "message": "Target not seen in recent scan windows.",
-                            }
-                        )
-                    else:
-                        print(
-                            f"{iso_now()} | target not seen for {missed_scans} consecutive scan windows"
-                        )
+                # Still check missed scans, but on a separate timer or logic
+                continue
+
+            # Only process if it matches the CURRENTLY ACTIVE target
+            address = getattr(device, "address", "Unknown")
+            name = normalize_name(device, advertisement_data)
+            if not manager.is_active(address, name):
                 continue
 
             missed_scans = 0
             rssi = extract_rssi(device, advertisement_data)
             if rssi is None:
-                if args.json_lines:
-                    print_json_line(
-                        {
-                            "type": "warning",
-                            "timestamp": iso_now(),
-                            "message": "Target found, but RSSI is unavailable on this update.",
-                        }
-                    )
-                else:
-                    print(f"{iso_now()} | target found, but RSSI is unavailable on this update")
                 continue
+            
             if window.is_outlier(rssi):
                 continue
 
@@ -599,8 +690,8 @@ async def track_device(args: argparse.Namespace) -> None:
             distance_cm = quantize_distance_cm(distance_m)
             reading = DeviceReading(
                 timestamp=iso_now(),
-                address=getattr(device, "address", "Unknown"),
-                name=normalize_name(device, advertisement_data),
+                address=address,
+                name=name,
                 rssi=rssi,
                 smoothed_rssi=smoothed_rssi,
                 raw_distance_m=raw_distance_m,
@@ -637,22 +728,46 @@ async def track_device(args: argparse.Namespace) -> None:
 
 async def main() -> None:
     args = parse_args()
+    
     if args.list:
         await list_devices(args.scan_time, args.json_output)
         return
     if args.diagnose:
         await diagnose_devices(args.scan_time, args.json_output)
         return
-    if args.choose:
-        selection = await choose_device_interactively(args.scan_time)
-        if selection is None:
-            print("No device selected.")
-            return
-        selected_name, selected_address = selection
-        args.target_name = selected_name
-        args.target_address = selected_address
-        print(f"Tracking selected device: {selected_name} | {selected_address}")
-    await track_device(args)
+
+    # Main application loop
+    while True:
+        # 1. Selection Phase
+        if args.target_name or args.target_address:
+            # If targets provided via CLI/.env, use them directly the first time
+            pass
+        else:
+            selection = await choose_device_interactively(args.scan_time)
+            if selection is None:
+                break # User quit from selection
+            
+            selected_name, selected_address = selection
+            args.target_name = selected_name
+            args.target_address = selected_address
+            print(f"\nTarget set to: {selected_name} | {selected_address}")
+
+        # 2. Tracking Phase
+        print(f"\nStarting high-speed tracker for: {args.target_name or args.target_address}")
+        result = await track_device(args)
+        
+        if result == "quit":
+            print("\nQuitting...")
+            break
+        elif result == "back":
+            print("\nReturning to device selection...")
+            # Clear targets to force re-selection
+            args.target_name = None
+            args.target_address = None
+            continue
+        else:
+            # KeyboardInterrupt or other stop
+            break
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ const http = require("node:http");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+require("dotenv").config();
 
 const ROOT_DIR = __dirname;
 const TRACKER_SCRIPT = path.join(ROOT_DIR, "earpods_tracker.py");
@@ -16,6 +17,8 @@ const VENV_PYTHON = path.join(
 const PYTHON_BIN =
   process.env.PYTHON_BIN ||
   (fs.existsSync(VENV_PYTHON) ? VENV_PYTHON : process.platform === "win32" ? "python" : "python3");
+
+const activeProcesses = new Map();
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -248,6 +251,8 @@ function sendSse(res, eventName, payload) {
 function handleTrackStream(req, res, searchParams) {
   const args = buildTrackArgs(searchParams);
   const child = spawnPython(args);
+  
+  activeProcesses.set(child.pid.toString(), child);
 
   res.writeHead(200, {
     ...CORS_HEADERS,
@@ -271,6 +276,7 @@ function handleTrackStream(req, res, searchParams) {
     }
     closed = true;
     clearInterval(heartbeat);
+    activeProcesses.delete(child.pid.toString());
     if (!child.killed) {
       child.kill();
     }
@@ -339,6 +345,7 @@ function rootPayload() {
       "GET /api/diagnostics?scanTime=2",
       "GET /api/track/stream?targetName=My%20Earbuds",
       "GET /api/track/stream?targetAddress=<BLUETOOTH_ADDRESS>&fast=true",
+      "POST /api/track/command/:pid (Body: {command: 'n' | 'b' | 'q'})",
     ],
   };
 }
@@ -353,8 +360,31 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
   try {
+    // Handle POST commands for switching/stopping
+    if (req.method === "POST" && url.pathname.startsWith("/api/track/command/")) {
+      const pid = url.pathname.split("/").pop();
+      const child = activeProcesses.get(pid);
+      if (!child) {
+        throw new HttpError(404, `Process ${pid} not found.`);
+      }
+
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        const payload = JSON.parse(body || "{}");
+        const command = payload.command || "";
+        if (["n", "b", "q"].includes(command)) {
+          child.stdin.write(command + "\n");
+          sendJson(res, 200, { ok: true, message: `Sent command '${command}' to process ${pid}` });
+        } else {
+          sendError(res, new HttpError(400, "Invalid command. Use 'n', 'b', or 'q'."));
+        }
+      });
+      return;
+    }
+
     if (req.method !== "GET") {
-      throw new HttpError(405, "Only GET and OPTIONS are supported.");
+      throw new HttpError(405, "Only GET, POST, and OPTIONS are supported.");
     }
 
     if (url.pathname === "/" || url.pathname === "/api") {

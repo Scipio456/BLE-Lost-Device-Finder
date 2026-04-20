@@ -20,11 +20,12 @@ Important limit: this does not measure exact physical distance. It gives a live 
 
 ## What You Need To Install
 
-Only one external package is required:
+Only two external packages are required:
 
 - `bleak`
+- `python-dotenv`
 
-Create a virtual environment and install it there:
+Create a virtual environment and install them there:
 
 ```powershell
 python -m venv .venv
@@ -32,13 +33,21 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Or directly:
+## Configuration (.env)
+
+For easier tracking and to keep your device information safe from Git, copy `.env.example` to `.env` and fill in your targets:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install bleak
+cp .env.example .env
 ```
 
-The rest of the imports used by the program are from Python's standard library and do not need separate installation.
+Edit `.env`:
+```env
+TARGET_ADDRESSES=AA:BB:CC:DD:EE:FF,11:22:33:44:55:66
+TARGET_NAMES=My Earbuds,Other Buds
+```
+
+The tracker will automatically load these targets on startup.
 
 ## Files
 
@@ -317,6 +326,16 @@ Track by address with a custom calibration:
 ```powershell
 python earpods_tracker.py --target-address "<BLUETOOTH_ADDRESS>" --reference-rssi -54 --path-loss 3.0
 ```
+
+## Navigation & Controls
+
+While tracking, you can use the following keys (on Windows):
+
+- **'n'**: Cycle to the next target (if multiple targets were specified in `.env`).
+- **'b'**: **Back** to the main device selection list. Stops tracking the current device.
+- **'q'**: **Quit** the application.
+
+## Multi-Device Tracking
 
 ## Command-Line Options
 
